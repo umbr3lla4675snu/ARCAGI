@@ -3,8 +3,14 @@ import torch
 from typing import List
 import numpy as np
 
-from .utils import system_prompt, user_message_template1, user_message_template2, user_message_template3
+from utils import system_prompt, user_message_template1, user_message_template2, user_message_template3 #.
 from transformers import BitsAndBytesConfig, AutoModelForCausalLM, AutoTokenizer
+
+from torch.utils.data import Dataset, DataLoader  # ✨[NEW]
+import os                                        # ✨[NEW]
+import json
+from pathlib import Path
+import numpy as np
 
 """
 Lets go team7, Check the README.md for more information.
@@ -28,14 +34,14 @@ class ARCSolver:
             load_in_4bit=True,  # Enable 4-bit quantization
             bnb_4bit_use_double_quant=True,  # Use double quantization for improved precision
             bnb_4bit_quant_type="nf4",  # Specify the quantization type
-            bnb_4bit_compute_dtype=torch.float16,  # Set the computation data type
+            bnb_4bit_compute_dtype=torch.bfloat16 # Set the computation data type
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
             trust_remote_code=True, # Allow the model to use custom code from the repository
             quantization_config=bnb_config, # Apply the 4-bit quantization configuration
             attn_implementation='sdpa', # Use scaled-dot product attention for better performance
-            torch_dtype=torch.float16, # Set the data type for the model
+            torch_dtype=torch.bfloat16,  # ← 기존: torch.float16 # Set the data type for the model
             use_cache=False, # Disable caching to save memory
             device_map='auto', # Automatically map the model to available devices (e.g., GPUs)
             token=token
@@ -90,7 +96,7 @@ class ARCSolver:
             ids.append(self.sep)
         return ids
 
-    def format_prompt(self, datapoint):
+    def format_prompt(self, datapoint, training_mode=False):
         """
         Args:
             datapoint (dict): contains training data, test input
@@ -128,6 +134,11 @@ class ARCSolver:
         assis = self.tokenizer.encode("<|eot_id|><|start_header_id|>assistant<|end_header_id|>", add_special_tokens=False)
         messages += assis
 
+        if training_mode:
+            # ✅ 학습 시에는 정답 출력을 붙여야 함
+            answer_tokens = self.format_grid(datapoint['test'][0]['output'])
+            messages += answer_tokens
+
         return {
             "input_ids": messages,
             "input": input_test_data,
@@ -140,7 +151,62 @@ class ARCSolver:
         Train a model with train_dataset.
         Read a project documentation for a description of `examples` and `question`.
         """
-        pass
+        """
+        ✨[NEW] Naive training loop using teacher forcing and prompt tokens as labels
+        """
+        class ARCDataset(Dataset):
+            def __init__(self, dataset, tokenizer, format_prompt_fn):
+                self.data = []
+                self.tokenizer = tokenizer
+                for item in dataset:
+                    prompt = format_prompt_fn(item, training_mode=True)
+                    input_ids = prompt['input_ids']
+                    labels = input_ids.copy()
+                    self.data.append((input_ids, labels))
+
+            def __len__(self):
+                return len(self.data)
+
+            def __getitem__(self, idx):
+                input_ids, labels = self.data[idx]
+                return {
+                    "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                    "labels": torch.tensor(labels, dtype=torch.long),
+                }
+
+        def collate_fn(batch):
+            input_ids = [item["input_ids"] for item in batch]
+            labels = [item["labels"] for item in batch]
+            input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=0)
+            labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+            return {"input_ids": input_ids, "labels": labels}
+
+        dataset = ARCDataset(train_dataset, self.tokenizer, self.format_prompt)
+        loader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
+
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=5e-6)
+
+        self.model.train()
+        self.model.to(self.device)
+
+        for step, batch in enumerate(loader):
+            input_ids = batch["input_ids"].to(self.device)
+            labels = batch["labels"].to(self.device)
+            
+            outputs = self.model(input_ids=input_ids, labels=labels)
+            loss = outputs.loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            if step % 10 == 0:
+                print(f"Step {step}: loss = {loss.item():.4f}")
+
+        save_dir = "artifacts/checkpoint-final"
+        os.makedirs(save_dir, exist_ok=True)
+        self.model.save_pretrained(save_dir)
+        self.tokenizer.save_pretrained(save_dir)        
 
     def predict(self, examples, questions_input):
         """
@@ -220,10 +286,39 @@ class ARCSolver:
         self.model.load_adapter("artifacts/checkpoint-final")
         self.model.eval()
 
+def load_training_data(base_dir, N=300):
+    filenames = [f for f in os.listdir(base_dir) if f.endswith(".json")]
+    dataset = []
+    rng = np.random.default_rng(1337)
+
+    for file in filenames[:N]:  # limit for now
+        with open(os.path.join(base_dir, file)) as fp:
+            task_data = json.load(fp)
+        if len(task_data) < 4:
+            continue
+        for _ in range(1):  # create 1 training instance per task
+            idx = rng.choice(len(task_data), size=4, replace=False)
+            train_data = [task_data[i] for i in idx[:3]]
+            test_example = task_data[idx[3]]  # ✅ test_input + output 모두 포함
+
+            datapoint = {
+                "train": train_data,
+                "test": [ 
+                    { 
+                        "input": test_example["input"], 
+                        "output": test_example["output"]  # ✅ 정답 포함!
+                    }
+                ]
+            }
+            dataset.append(datapoint)
+    return dataset
 
 if __name__ == "__main__":
-    solver = ARCSolver()
+    #solver = ARCSolver()
+    #loaded_data = load_json_dataset("/workspace/dataset")  # 실제 데이터 경로
+    #solver.train(loaded_data)
+    token = os.environ.get("HF_TOKEN", None)
+    solver = ARCSolver(token=token)
 
-
-
-
+    train_data = load_training_data("/workspace/dataset", N=300)
+    solver.train(train_data)
